@@ -1,6 +1,8 @@
 import math
 import torch
 import torch.nn as nn
+from .quantization import QuantizeWeights, QuantizeActivations
+
 try:
     from ..functions import get_timestep_embedding
     from ..modules import Linear, Conv2d, SamePad2d, Sequential
@@ -232,6 +234,51 @@ class UNet(nn.Module):
         h = self.out_conv(h)
         return h
 
+class QuantizedUNet(UNet):
+    def __init__(self, in_channels, out_channels, hid_channels, ch_multipliers, num_res_blocks, drop_rate, resample_with_conv, time_embedding_dim=None, apply_attn=True, bit_width=8):
+        super(QuantizedUNet, self).__init__(in_channels, out_channels, hid_channels, ch_multipliers, num_res_blocks, drop_rate, resample_with_conv, time_embedding_dim, apply_attn)
+        self.bit_width = bit_width
+
+        # Add quantization layers
+        self.weight_quantizer = QuantizeWeights(bit_width)
+        self.activation_quantizer = QuantizeActivations(bit_width)
+
+        # Apply weight quantization to all layers
+        self.apply_weight_quantization()
+
+    def forward(self, x, t):
+        t_emb = self.embed(self.get_timestep_embedding(t, self.hid_channels))
+
+        # downsample
+        hs = [self.in_conv(x)]
+        hs[0] = self.activation_quantizer(hs[0])  # Quantize activations
+        for i in range(self.levels):
+            downsample = self.downsamples[f"level_{i}"]
+            for j, layer in enumerate(downsample):
+                h = hs[-1]
+                if j != self.num_res_blocks:
+                    h = layer(h, t_emb=t_emb)
+                else:
+                    h = layer(h)
+                h = self.activation_quantizer(h)  # Quantize activations
+                hs.append(h)
+
+        # middle
+        h = self.middle(hs[-1], t_emb=t_emb)
+        h = self.activation_quantizer(h)  # Quantize activations
+
+        # upsample
+        for i in range(self.levels-1, -1, -1):
+            upsample = self.upsamples[f"level_{i}"]
+            for j, layer in enumerate(upsample):
+                if j != self.num_res_blocks + 1:
+                    h = layer(torch.cat([h, hs.pop()], dim=1), t_emb=t_emb)
+                else:
+                    h = layer(h)
+                h = self.activation_quantizer(h)  # Quantize activations
+
+        h = self.out_conv(h)
+        return h
 
 if __name__ == "__main__":
     model = UNet(3, 128, 3, (1, 2, 3), 2, (False, True, False))
