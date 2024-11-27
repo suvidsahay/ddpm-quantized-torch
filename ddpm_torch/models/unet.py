@@ -235,21 +235,37 @@ class UNet(nn.Module):
         return h
 
 class QuantizedUNet(UNet):
-    def __init__(self, in_channels, out_channels, hid_channels, ch_multipliers, num_res_blocks, drop_rate, resample_with_conv, time_embedding_dim=None, apply_attn=True, bit_width=8):
-        super(QuantizedUNet, self).__init__(in_channels, out_channels, hid_channels, ch_multipliers, num_res_blocks, drop_rate, resample_with_conv, time_embedding_dim, apply_attn)
+    def __init__(self, in_channels, out_channels, hid_channels, ch_multipliers, num_res_blocks, drop_rate, resample_with_conv=True, time_embedding_dim=None, apply_attn=True, bit_width=8):
+        super(QuantizedUNet, self).__init__(in_channels=in_channels, hid_channels=hid_channels, out_channels=out_channels, ch_multipliers=ch_multipliers, num_res_blocks=num_res_blocks, drop_rate=drop_rate, resample_with_conv=resample_with_conv, time_embedding_dim=time_embedding_dim, apply_attn=apply_attn)
         self.bit_width = bit_width
 
         # Add quantization layers
         self.weight_quantizer = QuantizeWeights(bit_width)
         self.activation_quantizer = QuantizeActivations(bit_width)
 
-        # Apply weight quantization to all layers
-        self.apply_weight_quantization()
+        # Flag to indicate initialization
+        self.initialized = False
 
-    def forward(self, x, t):
-        t_emb = self.embed(self.get_timestep_embedding(t, self.hid_channels))
+    def initialize_quantization_intervals(self):
+        """Initialize weight and activation intervals."""
+        # Initialize weight intervals
+        for name, param in self.named_parameters():
+            if 'weight' in name:
+                self.weight_quantizer.initialize_interval(param)
 
-        # downsample
+        # Initialize activation intervals
+        dummy_input = torch.randn(1, self.in_channels, 64, 64)  # Replace dimensions appropriately
+        with torch.no_grad():
+            _ = self._run_once_for_initialization(dummy_input, torch.tensor([0]))  # Dummy forward pass to capture activations
+
+        self.initialized = True
+
+    def _run_once_for_initialization(self, x, t):
+        """Helper method for running a single forward pass for initialization purposes."""
+        t_emb = get_timestep_embedding(t, self.hid_channels)
+        t_emb = self.embed(t_emb)
+
+        # Downsample
         hs = [self.in_conv(x)]
         hs[0] = self.activation_quantizer(hs[0])  # Quantize activations
         for i in range(self.levels):
@@ -260,25 +276,64 @@ class QuantizedUNet(UNet):
                     h = layer(h, t_emb=t_emb)
                 else:
                     h = layer(h)
-                h = self.activation_quantizer(h)  # Quantize activations
                 hs.append(h)
 
-        # middle
+        # Middle
         h = self.middle(hs[-1], t_emb=t_emb)
-        h = self.activation_quantizer(h)  # Quantize activations
 
-        # upsample
-        for i in range(self.levels-1, -1, -1):
+        # Upsample
+        for i in range(self.levels - 1, -1, -1):
             upsample = self.upsamples[f"level_{i}"]
             for j, layer in enumerate(upsample):
                 if j != self.num_res_blocks + 1:
                     h = layer(torch.cat([h, hs.pop()], dim=1), t_emb=t_emb)
                 else:
                     h = layer(h)
+
+        return self.out_conv(h)
+
+    def forward(self, x, t):
+        # Initialize quantization intervals during the first forward pass
+        if not self.initialized:
+            self.initialize_quantization_intervals()
+
+        # Regular forward pass
+        t_emb = get_timestep_embedding(t, self.hid_channels)
+        t_emb = self.embed(t_emb)
+
+        # Downsample
+        hs = [self.in_conv(x)]
+        hs[0] = self.activation_quantizer(hs[0])  # Quantize activations
+        for i in range(self.levels):
+            downsample = self.downsamples[f"level_{i}"]
+            for j, layer in enumerate(downsample):
+                h = hs[-1]
+                if j != self.num_res_blocks:
+                    h = layer(h, t_emb=t_emb)
+                else:
+                    h = layer(h)
+                h = self.weight_quantizer(h)  # Quantize weights
+                h = self.activation_quantizer(h)  # Quantize activations
+                hs.append(h)
+
+        # Middle
+        h = self.middle(hs[-1], t_emb=t_emb)
+        h = self.activation_quantizer(h)  # Quantize activations
+
+        # Upsample
+        for i in range(self.levels - 1, -1, -1):
+            upsample = self.upsamples[f"level_{i}"]
+            for j, layer in enumerate(upsample):
+                if j != self.num_res_blocks + 1:
+                    h = layer(torch.cat([h, hs.pop()], dim=1), t_emb=t_emb)
+                else:
+                    h = layer(h)
+                h = self.weight_quantizer(h)  # Quantize weights
                 h = self.activation_quantizer(h)  # Quantize activations
 
         h = self.out_conv(h)
         return h
+
 
 if __name__ == "__main__":
     model = UNet(3, 128, 3, (1, 2, 3), 2, (False, True, False))
