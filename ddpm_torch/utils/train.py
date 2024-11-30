@@ -276,6 +276,321 @@ class Trainer:
             yield k, getattr(self, k).state_dict()
 
 
+class CoStudyTrainer:
+    def __init__(
+            self,
+            model_student,
+            model_teacher,
+            optimizer_student,
+            optimizer_teacher,
+            diffusion,
+            epochs,
+            trainloader,
+            sampler=None,
+            scheduler_student=None,
+            scheduler_teacher=None,
+            num_accum=1,
+            use_ema=False,
+            grad_norm=1.0,
+            shape=None,
+            device=torch.device("cpu"),
+            chkpt_intv=5,
+            image_intv=1,
+            num_samples=64,
+            ema_decay=0.9999,
+            distributed=False,
+            rank=0,  # process id for distributed training
+            dry_run=False
+    ):
+        self.model_student = model_student
+        self.model_teacher = model_teacher
+        self.optimizer_student = optimizer_student
+        self.optimizer_teacher = optimizer_teacher
+        self.diffusion = diffusion
+        self.epochs = epochs
+        self.start_epoch = 0
+        self.trainloader = trainloader
+        self.sampler = sampler
+        if shape is None:
+            shape = next(iter(trainloader))[0].shape[1:]
+        self.shape = shape
+        self.scheduler_student = DummyScheduler() if scheduler_student is None else scheduler_student
+        self.scheduler_teacher = DummyScheduler() if scheduler_teacher is None else scheduler_teacher
+
+        self.num_accum = num_accum
+        self.grad_norm = grad_norm
+        self.device = device
+        self.chkpt_intv = chkpt_intv
+        self.image_intv = image_intv
+        self.num_samples = num_samples
+
+        if distributed:
+            assert sampler is not None
+        self.distributed = distributed
+        self.rank = rank
+        self.dry_run = dry_run
+        self.is_leader = rank == 0
+        self.world_size = int(os.environ.get("WORLD_SIZE", "1"))
+
+        # maintain a process-specific generator
+        self.generator = torch.Generator(device).manual_seed(8191 + self.rank)
+
+        self.sample_seed = 131071 + self.rank  # process-specific seed
+
+        self.use_ema = use_ema
+        if use_ema:
+            if isinstance(model_student, DDP):
+                self.ema_student = EMA(model_student.module, decay=ema_decay)
+            else:
+                self.ema_student = EMA(model_student, decay=ema_decay)
+
+            if isinstance(model_teacher, DDP):
+                self.ema_teacher = EMA(model_teacher.module, decay=ema_decay)
+            else:
+                self.ema_teacher = EMA(model_teacher, decay=ema_decay)
+        else:
+            self.ema_student = nullcontext()
+            self.ema_teacher = nullcontext()
+
+        self.stats = RunningStatistics(teacher_loss=None, student_loss=None)
+    
+    @property
+    def timesteps(self):
+        return self.diffusion.timesteps
+
+    def get_input(self, x):
+        x = x.to(self.device)
+        return {
+            "x_0": x,
+            "t": torch.empty((x.shape[0],), dtype=torch.int64, device=self.device).random_(
+                to=self.timesteps, generator=self.generator),
+            "noise": torch.empty_like(x).normal_(generator=self.generator)
+        }
+    
+
+    def softmax_with_temperature(self, logits, temperature):
+        import torch.nn.functional as F
+        return F.softmax(logits / temperature, dim=-1)
+    
+    def kl_divergence_loss(self, p_t, p_s):
+        return torch.sum(p_t * (torch.log(p_t + 1e-8) - torch.log(p_s + 1e-8)), dim=-1)
+    
+    def mse_loss(self, x):
+        loss = self.diffusion.train_losses(self.model, **self.get_input(x))
+        assert loss.shape == (x.shape[0],)
+        return loss
+
+    def co_studying_loss(self, x, teacher_logits, student_logits, temperature=1.0):
+        import torch.nn.functional as F
+
+        # Softened probabilities
+        teacher_soft = self.softmax_with_temperature(teacher_logits, temperature)
+        student_soft = self.softmax_with_temperature(student_logits, temperature)
+        
+        # MSE loss for both networks
+        teacher_mse_loss = self.loss(x).mean()
+        student_mse_loss = self.loss(x).mean()
+        
+        # KL divergence loss (softened)
+        kl_loss_student = self.kl_divergence_loss(teacher_soft, student_soft)
+        kl_loss_teacher = self.kl_divergence_loss(student_soft, teacher_soft)
+        
+        # Combine losses
+        student_loss = student_mse_loss + (temperature ** 2) * kl_loss_student.mean()
+        teacher_loss = teacher_mse_loss + (temperature ** 2) * kl_loss_teacher.mean()
+        
+        return teacher_loss, student_loss
+
+    def step(self, x, global_steps=1):
+        # Compute teacher and student logits
+        teacher_logits = self.teacher(x)
+        student_logits = self.student(x)
+        
+        # Compute co-studying losses
+        teacher_loss, student_loss = self.co_studying_loss(
+            x, teacher_logits, student_logits, temperature=self.temperature
+        )
+        
+        # Mean-reduce losses
+        teacher_loss = teacher_loss.mean()
+        student_loss = student_loss.mean()
+        
+        # Backward pass for teacher
+        teacher_loss.div(self.num_accum).backward()  # average over accumulated mini-batches
+        if global_steps % self.num_accum == 0:
+            nn.utils.clip_grad_norm_(self.teacher.parameters(), max_norm=self.grad_norm)
+            self.teacher_optimizer.step()
+            self.teacher_optimizer.zero_grad(set_to_none=True)
+
+        # Backward pass for student
+        student_loss.div(self.num_accum).backward()  # average over accumulated mini-batches
+        if global_steps % self.num_accum == 0:
+            nn.utils.clip_grad_norm_(self.student.parameters(), max_norm=self.grad_norm)
+            self.student_optimizer.step()
+            self.student_optimizer.zero_grad(set_to_none=True)
+        
+        # Scheduler updates (if applicable)
+        self.teacher_scheduler.step()
+        self.student_scheduler.step()
+
+        # EMA updates (optional)
+        if self.use_ema:
+            if hasattr(self.teacher_ema, "update"):
+                self.teacher_ema.update()
+            if hasattr(self.student_ema, "update"):
+                self.student_ema.update()
+        
+        # Detach losses for logging
+        teacher_loss = teacher_loss.detach()
+        student_loss = student_loss.detach()
+        
+        # Distributed loss synchronization (if applicable)
+        if self.distributed:
+            dist.reduce(teacher_loss, dst=0, op=dist.ReduceOp.SUM)
+            dist.reduce(student_loss, dst=0, op=dist.ReduceOp.SUM)
+            teacher_loss.div_(self.world_size)
+            student_loss.div_(self.world_size)
+
+        # Update statistics (use separate stats for teacher and student if needed)
+        self.stats.update(x.shape[0], teacher_loss=teacher_loss.item() * x.shape[0])
+        self.stats.update(x.shape[0], student_loss=student_loss.item() * x.shape[0])
+
+
+    def sample_fn(self, sample_size=None, noise=None, diffusion=None, sample_seed=None):
+        if noise is None:
+            shape = (sample_size // self.world_size,) + self.shape
+        else:
+            shape = noise.shape
+        if diffusion is None:
+            diffusion = self.diffusion
+        with self.ema:
+            sample = diffusion.p_sample(
+                denoise_fn=self.model, shape=shape,
+                device=self.device, noise=noise, seed=sample_seed)
+        if self.distributed:
+            # equalizes GPU memory usages across all processes within the same process group
+            sample_list = [torch.zeros(shape, device=self.device) for _ in range(self.world_size)]
+            dist.all_gather(sample_list, sample)
+            sample = torch.cat(sample_list, dim=0)
+        assert sample.grad is None
+        return sample
+
+    def train(self, evaluator=None, student_chkpt_path=None, teacher_chkpt_path=None, image_dir=None):
+        nrow = math.floor(math.sqrt(self.num_samples))
+        if self.num_samples:
+            assert self.num_samples % self.world_size == 0, "Number of samples should be divisible by WORLD_SIZE!"
+
+        if self.dry_run:
+            self.start_epoch, self.epochs = 0, 1
+
+        global_steps = 0
+        for e in range(self.start_epoch, self.epochs):
+            self.stats.reset()
+            self.model_student.train()
+            self.model_teacher.train()
+            results = dict()
+            if isinstance(self.sampler, DistributedSampler):
+                self.sampler.set_epoch(e)
+            with tqdm(self.trainloader, desc=f"{e + 1}/{self.epochs} epochs", disable=not self.is_leader) as t:
+                for i, x in enumerate(t):
+                    if isinstance(x, (list, tuple)):
+                        x = x[0]  # unconditional model -> discard labels
+                    global_steps += 1
+                    self.step(x.to(self.device), global_steps=global_steps)
+                    t.set_postfix(self.current_stats)
+                    results.update(self.current_stats)
+                    if self.dry_run and not global_steps % self.num_accum:
+                        break
+
+            if not (e + 1) % self.image_intv and self.num_samples and image_dir:
+                self.model_student.eval()
+                self.model_teacher.eval()
+                x = self.sample_fn(sample_size=self.num_samples, sample_seed=self.sample_seed).cpu()
+                if self.is_leader:
+                    save_image(x, os.path.join(image_dir, f"{e + 1}.jpg"), nrow=nrow)
+
+            if not (e + 1) % self.chkpt_intv and student_chkpt_path:
+                self.model_student.eval()
+                if evaluator is not None:
+                    eval_results = evaluator.eval(self.sample_fn, is_leader=self.is_leader)
+                else:
+                    eval_results = dict()
+                results.update(eval_results)
+                if self.is_leader:
+                    self.save_checkpoint(student_chkpt_path, epoch=e + 1, **results)
+            
+            if not (e + 1) % self.chkpt_intv and teacher_chkpt_path:
+                self.model_teacher.eval()
+                if evaluator is not None:
+                    eval_results = evaluator.eval(self.sample_fn, is_leader=self.is_leader)
+                else:
+                    eval_results = dict()
+                results.update(eval_results)
+                if self.is_leader:
+                    self.save_checkpoint(teacher_chkpt_path, epoch=e + 1, **results)
+
+            if self.distributed:
+                dist.barrier()  # synchronize all processes here
+
+    @property
+    def trainees(self):
+        roster = ["model", "optimizer"]
+        if self.use_ema:
+            roster.append("ema")
+        if self.scheduler is not None:
+            roster.append("scheduler")
+        return roster
+
+    @property
+    def current_stats(self):
+        return self.stats.extract()
+
+    def load_checkpoint(self, student_chkpt_path, teacher_chkpt_path, map_location):
+    # Load student checkpoint
+        student_chkpt = torch.load(student_chkpt_path, map_location=map_location)
+        for trainee in self.trainees:
+            try:
+                getattr(self, trainee).load_state_dict(student_chkpt[trainee])
+            except RuntimeError:
+                _chkpt = student_chkpt[trainee]["shadow"] if trainee == "ema" else student_chkpt[trainee]
+                for k in list(_chkpt.keys()):
+                    if k.startswith("module."):
+                        _chkpt[k.split(".", maxsplit=1)[1]] = _chkpt.pop(k)
+                getattr(self, trainee).load_state_dict(student_chkpt[trainee])
+            except AttributeError:
+                continue
+
+        # Load teacher checkpoint
+        teacher_chkpt = torch.load(teacher_chkpt_path, map_location=map_location)
+        for trainee in self.trainees:
+            try:
+                getattr(self, trainee).load_state_dict(teacher_chkpt[trainee])
+            except RuntimeError:
+                _chkpt = teacher_chkpt[trainee]["shadow"] if trainee == "ema" else teacher_chkpt[trainee]
+                for k in list(_chkpt.keys()):
+                    if k.startswith("module."):
+                        _chkpt[k.split(".", maxsplit=1)[1]] = _chkpt.pop(k)
+                getattr(self, trainee).load_state_dict(teacher_chkpt[trainee])
+            except AttributeError:
+                continue
+
+        # Set start epoch from student checkpoint
+        self.start_epoch = student_chkpt["epoch"]
+
+    def save_checkpoint(self, chkpt_path, **extra_info):
+        chkpt = []
+        for k, v in self.named_state_dicts():
+            chkpt.append((k, v))
+        for k, v in extra_info.items():
+            chkpt.append((k, v))
+        if "epoch" in extra_info:
+            chkpt_path = re.sub(r"(_\d+)?\.pt", f"_{extra_info['epoch']}.pt", chkpt_path)
+        torch.save(dict(chkpt), chkpt_path)
+
+    def named_state_dicts(self):
+        for k in self.trainees:
+            yield k, getattr(self, k).state_dict()
+
 class EMA:
     """
     exponential moving average
