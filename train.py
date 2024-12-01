@@ -66,10 +66,8 @@ def train(rank=0, args=None, temp_dir=""):
     block_size = model_config.pop("block_size", args.block_size)
     model_config["in_channels"] = in_channels * block_size ** 2
     model_config["out_channels"] = out_channels * block_size ** 2
-    if args.use_quantized_unet:
-        _model = QuantizedUNet(**model_config)
-    else:
-        _model = UNet(**model_config)
+    model_config["is_quantized"] = args.use_quantized_unet
+    _model = QuantizedUNet(**model_config)
 
     if block_size > 1:
         pre_transform = torch.nn.PixelUnshuffle(block_size)  # space-to-depth
@@ -284,7 +282,7 @@ def main():
     parser.add_argument("--rigid-launch", action="store_true", help="whether to use torch multiprocessing spawn")
     parser.add_argument("--num-gpus", default=1, type=int, help="number of gpus for distributed training")
     parser.add_argument("--dry-run", action="store_true", help="test-run till the first model update completes")
-    parser.add_argument("--use-quantized-unet", default=False, action="store_false", help="whether to use quantization in UNet")
+    parser.add_argument("--use-quantized-unet", action="store_true", help="whether to use quantization in UNet")
 
     args = parser.parse_args()
 

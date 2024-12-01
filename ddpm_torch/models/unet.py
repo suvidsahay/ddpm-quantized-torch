@@ -235,7 +235,7 @@ class UNet(nn.Module):
         return h
 
 class QuantizedUNet(UNet):
-    def __init__(self, in_channels, out_channels, hid_channels, ch_multipliers, num_res_blocks, drop_rate, resample_with_conv=True, time_embedding_dim=None, apply_attn=True, bit_width=8):
+    def __init__(self, in_channels, out_channels, hid_channels, ch_multipliers, num_res_blocks, drop_rate, resample_with_conv=True, time_embedding_dim=None, apply_attn=True, bit_width=8, is_quantized=False):
         super(QuantizedUNet, self).__init__(in_channels=in_channels, hid_channels=hid_channels, out_channels=out_channels, ch_multipliers=ch_multipliers, num_res_blocks=num_res_blocks, drop_rate=drop_rate, resample_with_conv=resample_with_conv, time_embedding_dim=time_embedding_dim, apply_attn=apply_attn)
         self.bit_width = bit_width
 
@@ -243,11 +243,18 @@ class QuantizedUNet(UNet):
         self.weight_quantizer = QuantizeWeights(bit_width)
         self.activation_quantizer = QuantizeActivations(bit_width)
 
+        self.is_quantized = is_quantized
+        self.is_quantized = getattr(self, "is_quantized", False)
+
         # Flag to indicate initialization
         self.initialized = False
+        print(self.is_quantized)
 
     def initialize_quantization_intervals(self):
         """Initialize weight and activation intervals."""
+        if self.initialized:
+            return
+
         # Initialize weight intervals
         for name, param in self.named_parameters():
             if 'weight' in name:
@@ -267,7 +274,8 @@ class QuantizedUNet(UNet):
 
         # Downsample
         hs = [self.in_conv(x)]
-        hs[0] = self.activation_quantizer(hs[0])  # Quantize activations
+        if self.is_quantized:
+            hs[0] = self.activation_quantizer(hs[0])  # Quantize activations
         for i in range(self.levels):
             downsample = self.downsamples[f"level_{i}"]
             for j, layer in enumerate(downsample):
@@ -294,7 +302,7 @@ class QuantizedUNet(UNet):
 
     def forward(self, x, t):
         # Initialize quantization intervals during the first forward pass
-        if not self.initialized:
+        if self.is_quantized:
             self.initialize_quantization_intervals()
 
         # Regular forward pass
@@ -303,7 +311,8 @@ class QuantizedUNet(UNet):
 
         # Downsample
         hs = [self.in_conv(x)]
-        hs[0] = self.activation_quantizer(hs[0])  # Quantize activations
+        if self.is_quantized:
+            hs[0] = self.activation_quantizer(hs[0])  # Quantize activations
         for i in range(self.levels):
             downsample = self.downsamples[f"level_{i}"]
             for j, layer in enumerate(downsample):
@@ -312,13 +321,15 @@ class QuantizedUNet(UNet):
                     h = layer(h, t_emb=t_emb)
                 else:
                     h = layer(h)
-                h = self.weight_quantizer(h)  # Quantize weights
-                h = self.activation_quantizer(h)  # Quantize activations
+                if self.is_quantized:
+                    h = self.weight_quantizer(h)  # Quantize weights
+                    h = self.activation_quantizer(h)  # Quantize activations
                 hs.append(h)
 
         # Middle
         h = self.middle(hs[-1], t_emb=t_emb)
-        h = self.activation_quantizer(h)  # Quantize activations
+        if(self.is_quantized):
+            h = self.activation_quantizer(h)  # Quantize activations
 
         # Upsample
         for i in range(self.levels - 1, -1, -1):
@@ -328,8 +339,9 @@ class QuantizedUNet(UNet):
                     h = layer(torch.cat([h, hs.pop()], dim=1), t_emb=t_emb)
                 else:
                     h = layer(h)
-                h = self.weight_quantizer(h)  # Quantize weights
-                h = self.activation_quantizer(h)  # Quantize activations
+                if self.is_quantized:
+                    h = self.weight_quantizer(h)  # Quantize weights
+                    h = self.activation_quantizer(h)  # Quantize activations
 
         h = self.out_conv(h)
         return h

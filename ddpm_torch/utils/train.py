@@ -11,6 +11,7 @@ import weakref
 from tqdm import tqdm
 from functools import partial
 from contextlib import nullcontext
+from ddpm_torch.models.unet import QuantizedUNet
 
 
 class DummyScheduler:
